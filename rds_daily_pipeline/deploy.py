@@ -26,12 +26,42 @@ class Config:
     schema: str; table: str; date_column: str; retention_days: int; dms_prefix: str
     bucket: str; raw_prefix: str; curated_prefix: str
     glue_database: str; glue_table: str; subnet_id: str; security_groups: list[str]
+    primary_key: str; child_tables: tuple[tuple[str, str], ...]; checksum_column: str
+    enable_purge: bool; purge_dry_run: bool; purge_batch_size: int; purge_vacuum: bool
 
 
 def _identifier(name: str, value: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", value):
         raise ValueError(f"{name} is not a valid PostgreSQL identifier: {value!r}")
     return value
+
+
+def _child_tables(raw: str) -> tuple[tuple[str, str], ...]:
+    """Parse ``child_table:fk_column`` pairs, ví dụ ``order_items:order_id``."""
+    pairs: list[tuple[str, str]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"PURGE_CHILD_TABLES cần dạng table:fk_column, nhận được {item!r}"
+            )
+        child, column = item.split(":", 1)
+        pairs.append((
+            _identifier("PURGE_CHILD_TABLES table", child.strip()),
+            _identifier("PURGE_CHILD_TABLES column", column.strip()),
+        ))
+    return tuple(pairs)
+
+
+def _sibling_path(path: str, name: str) -> str:
+    """Folder cùng cấp với ``path``, đổi segment cuối thành ``name``."""
+    return f"{path.rstrip('/').rsplit('/', 1)[0]}/{name}/"
+
+
+def _flag(key: str, default: str = "false") -> bool:
+    return os.getenv(key, default).strip().lower() == "true"
 
 
 def config() -> Config:
@@ -62,6 +92,15 @@ def config() -> Config:
             x.strip() for x in os.getenv("SECURITY_GROUP_IDS", "").split(",")
             if x.strip()
         ],
+        primary_key=_identifier("PRIMARY_KEY", required("PRIMARY_KEY")),
+        child_tables=_child_tables(os.getenv("PURGE_CHILD_TABLES", "")),
+        checksum_column=_identifier(
+            "PURGE_CHECKSUM_COLUMN", os.getenv("PURGE_CHECKSUM_COLUMN", "").strip()
+        ) if os.getenv("PURGE_CHECKSUM_COLUMN", "").strip() else "",
+        enable_purge=_flag("ENABLE_PURGE"),
+        purge_dry_run=_flag("PURGE_DRY_RUN", "true"),
+        purge_batch_size=int(os.getenv("PURGE_BATCH_SIZE", "500")),
+        purge_vacuum=_flag("PURGE_VACUUM"),
     )
 
 
@@ -164,7 +203,7 @@ def _bootstrap_metadata(cfg: Config, dms: Any, glue: Any) -> dict[str, str]:
     except glue.exceptions.EntityNotFoundException as error:
         raise RuntimeError(
             f"Glue bootstrap job not found: {bootstrap_job}. "
-            "Run dms/run_partition_initial.ipynb first."
+            "Run dms/run_setup.ipynb first."
         ) from error
     actual_target = job.get("DefaultArguments", {}).get("--TARGET_PATH", "").rstrip("/")
     expected_target = f"s3://{cfg.bucket}/{cfg.curated_prefix}".rstrip("/")
@@ -187,7 +226,7 @@ def _bootstrap_metadata(cfg: Config, dms: Any, glue: Any) -> dict[str, str]:
     if crawler.get("LastCrawl", {}).get("Status") != "SUCCEEDED":
         raise RuntimeError(
             f"Glue bootstrap crawler has not succeeded: {crawler_name}. "
-            "In dms/run_partition_initial.ipynb, reload partition_initial "
+            "In dms/run_pipeline.ipynb, reload partition_initial "
             "and call status_partition_job() to finalize the crawler."
         )
     return {
@@ -379,41 +418,67 @@ def setup() -> None:
     function_arn = f"arn:aws:lambda:{cfg.region}:{account}:function:{function_name}"
 
     script_key = f"{cfg.raw_prefix}/_pipeline/glue_job.py"
+    purge_key = f"{cfg.raw_prefix}/_pipeline/purge_job.py"
     s3.upload_file(str(ROOT / "glue_job.py"), cfg.bucket, script_key)
+    s3.upload_file(str(ROOT / "purge_job.py"), cfg.bucket, purge_key)
     glue_role = _role(iam, f"{cfg.name}-glue-role", "glue.amazonaws.com", [
         {"Effect": "Allow", "Action": ["logs:*", "glue:GetConnection", "glue:GetConnections"], "Resource": "*"},
         {"Effect": "Allow", "Action": ["ec2:CreateNetworkInterface", "ec2:DeleteNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups", "ec2:DescribeVpcEndpoints", "ec2:DescribeRouteTables", "ec2:DescribeVpcAttribute", "ec2:CreateTags"], "Resource": "*"},
         {"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket", "s3:PutObject", "s3:DeleteObject"], "Resource": [f"arn:aws:s3:::{cfg.bucket}", f"arn:aws:s3:::{cfg.bucket}/*"]},
     ])
+    raw_path = f"s3://{cfg.bucket}/{cfg.raw_prefix}/"
+    curated_path = f"s3://{cfg.bucket}/{cfg.curated_prefix}/"
+    child_spec = ",".join(f"{child}:{column}" for child, column in cfg.child_tables)
+    shared = {
+        "--CONNECTION_NAME": connection_name, "--SOURCE_SCHEMA": cfg.schema,
+        "--SOURCE_TABLE": cfg.table, "--DATE_COLUMN": cfg.date_column,
+        "--PRIMARY_KEY": cfg.primary_key, "--CHILD_TABLES": child_spec or "none",
+        "--job-language": "python",
+    }
     job_name = f"{cfg.name}-extract-transform"
     job_update = {
         "Role": glue_role,
         "Command": {"Name": "glueetl", "ScriptLocation": f"s3://{cfg.bucket}/{script_key}", "PythonVersion": "3"},
         "DefaultArguments": {
-            "--CONNECTION_NAME": connection_name, "--SOURCE_SCHEMA": cfg.schema,
-            "--SOURCE_TABLE": cfg.table, "--DATE_COLUMN": cfg.date_column,
-            "--RAW_PATH": f"s3://{cfg.bucket}/{cfg.raw_prefix}/",
-            "--CURATED_PATH": f"s3://{cfg.bucket}/{cfg.curated_prefix}/",
-            "--job-language": "python",
+            **shared, "--RAW_PATH": raw_path, "--CURATED_PATH": curated_path,
         },
         "Connections": {"Connections": [connection_name]},
         "GlueVersion": "4.0", "WorkerType": "G.1X", "NumberOfWorkers": 2,
         "MaxRetries": 0, "Timeout": 60,
     }
-    try:
-        glue.get_job(JobName=job_name)
-        glue.update_job(JobName=job_name, JobUpdate=job_update)
-    except glue.exceptions.EntityNotFoundException:
-        glue.create_job(Name=job_name, **job_update)
+    purge_job_name = f"{cfg.name}-purge-source"
+    purge_update = {
+        "Role": glue_role,
+        "Command": {"Name": "glueetl", "ScriptLocation": f"s3://{cfg.bucket}/{purge_key}", "PythonVersion": "3"},
+        "DefaultArguments": {
+            **shared, "--CURATED_PATH": curated_path,
+            "--CHECKSUM_COLUMN": cfg.checksum_column or "none",
+            "--DRY_RUN": str(cfg.purge_dry_run).lower(),
+            "--BATCH_SIZE": str(cfg.purge_batch_size),
+            "--RUN_VACUUM": str(cfg.purge_vacuum).lower(),
+        },
+        "Connections": {"Connections": [connection_name]},
+        "GlueVersion": "4.0", "WorkerType": "G.1X", "NumberOfWorkers": 2,
+        "MaxRetries": 0, "Timeout": 120,
+    }
+    for name, update in ((job_name, job_update), (purge_job_name, purge_update)):
+        try:
+            glue.get_job(JobName=name)
+            glue.update_job(JobName=name, JobUpdate=update)
+        except glue.exceptions.EntityNotFoundException:
+            glue.create_job(Name=name, **update)
 
     try:
         glue.get_database(Name=cfg.glue_database)
     except glue.exceptions.EntityNotFoundException:
         glue.create_database(DatabaseInput={"Name": cfg.glue_database})
     crawler_name = f"{cfg.name}-catalog"
+    crawler_targets = [{"Path": curated_path}] + [
+        {"Path": _sibling_path(curated_path, child)} for child, _ in cfg.child_tables
+    ]
     crawler = {
         "Role": glue_role, "DatabaseName": cfg.glue_database,
-        "Targets": {"S3Targets": [{"Path": f"s3://{cfg.bucket}/{cfg.curated_prefix}/"}]},
+        "Targets": {"S3Targets": crawler_targets},
         "TablePrefix": f"{cfg.glue_table}_",
         "SchemaChangePolicy": {"UpdateBehavior": "UPDATE_IN_DATABASE", "DeleteBehavior": "LOG"},
     }
@@ -428,7 +493,10 @@ def setup() -> None:
         {"Effect": "Allow", "Action": ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:BatchStopJobRun", "glue:StartCrawler", "glue:GetCrawler"], "Resource": "*"},
         {"Effect": "Allow", "Action": ["events:PutTargets", "events:PutRule", "events:DescribeRule"], "Resource": "*"},
     ])
-    definition = _state_machine(function_arn, job_name, crawler_name)
+    definition = _state_machine(
+        function_arn, job_name, crawler_name,
+        purge_job_name if cfg.enable_purge else "",
+    )
     state_name = f"{cfg.name}-workflow"
     state_arn = f"arn:aws:states:{cfg.region}:{account}:stateMachine:{state_name}"
     try:
@@ -446,6 +514,11 @@ def setup() -> None:
     events.put_targets(Rule=rule, Targets=[{"Id": "daily", "Arn": state_arn, "RoleArn": events_role}])
     print(f"Daily RDS pipeline ready: {state_arn}")
     print(f"Schedule: {rule_state} ({cfg.schedule})")
+    if not cfg.enable_purge:
+        print("Purge: DISABLED (chỉ archive, RDS giữ nguyên dữ liệu)")
+    else:
+        mode = "DRY RUN" if cfg.purge_dry_run else "DELETE THẬT"
+        print(f"Purge: ENABLED, {mode}, child={child_spec or 'none'}")
 
 
 def run_once() -> str:
@@ -559,12 +632,13 @@ def destroy() -> None:
         pass
 
     _delete_crawler(glue, f"{cfg.name}-catalog")
-    _stop_job_runs(glue, f"{cfg.name}-extract-transform")
-    try:
-        glue.delete_job(JobName=f"{cfg.name}-extract-transform")
-        print(f"Deleted Glue job: {cfg.name}-extract-transform")
-    except glue.exceptions.EntityNotFoundException:
-        pass
+    for job_name in (f"{cfg.name}-extract-transform", f"{cfg.name}-purge-source"):
+        _stop_job_runs(glue, job_name)
+        try:
+            glue.delete_job(JobName=job_name)
+            print(f"Deleted Glue job: {job_name}")
+        except glue.exceptions.EntityNotFoundException:
+            pass
     try:
         glue.delete_connection(ConnectionName=f"{cfg.name}-postgres")
         print(f"Deleted Glue connection: {cfg.name}-postgres")
@@ -585,9 +659,23 @@ def destroy() -> None:
     print("Preserved RDS, S3 bucket/objects, Glue database and catalog tables.")
 
 
-def _state_machine(function_arn: str, job_name: str, crawler_name: str) -> dict[str, Any]:
+def _state_machine(
+    function_arn: str, job_name: str, crawler_name: str, purge_job_name: str = ""
+) -> dict[str, Any]:
     invoke = "arn:aws:states:::lambda:invoke"
-    return {"StartAt": "Prepare", "States": {
+    # Purge nằm giữa crawler và commit: nếu xóa lỗi, watermark không commit và
+    # window đó được archive + verify lại ở lần chạy sau.
+    after_crawler = "PurgeSource" if purge_job_name else "Commit"
+    purge_states: dict[str, Any] = {} if not purge_job_name else {
+        "PurgeSource": {
+            "Type": "Task", "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Parameters": {"JobName": purge_job_name, "Arguments": {
+                "--WINDOW_FROM.$": "$.window_from", "--WINDOW_TO.$": "$.window_to",
+            }},
+            "ResultPath": "$.purge", "Next": "Commit",
+        }
+    }
+    return {"StartAt": "Prepare", "States": {**purge_states,
         "Prepare": {"Type": "Task", "Resource": invoke, "Parameters": {"FunctionName": function_arn, "Payload": {"action": "prepare"}}, "OutputPath": "$.Payload", "Next": "Skip?"},
         "Skip?": {"Type": "Choice", "Choices": [{"Variable": "$.skip", "BooleanEquals": True, "Next": "Done"}], "Default": "RunGlue"},
         "RunGlue": {"Type": "Task", "Resource": "arn:aws:states:::glue:startJobRun.sync", "Parameters": {"JobName": job_name, "Arguments": {"--WINDOW_FROM.$": "$.window_from", "--WINDOW_TO.$": "$.window_to", "--BATCH_DATE.$": "$.batch_date"}}, "ResultPath": "$.glue", "Next": "StartCrawler"},
@@ -595,7 +683,7 @@ def _state_machine(function_arn: str, job_name: str, crawler_name: str) -> dict[
         "WaitCrawler": {"Type": "Wait", "Seconds": 30, "Next": "CrawlerStatus"},
         "CrawlerStatus": {"Type": "Task", "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler", "Parameters": {"Name": crawler_name}, "ResultPath": "$.crawler_status", "Next": "CrawlerDone?"},
         "CrawlerDone?": {"Type": "Choice", "Choices": [{"Variable": "$.crawler_status.Crawler.State", "StringEquals": "READY", "Next": "CrawlerSucceeded?"}], "Default": "WaitCrawler"},
-        "CrawlerSucceeded?": {"Type": "Choice", "Choices": [{"Variable": "$.crawler_status.Crawler.LastCrawl.Status", "StringEquals": "SUCCEEDED", "Next": "Commit"}], "Default": "CrawlerFailed"},
+        "CrawlerSucceeded?": {"Type": "Choice", "Choices": [{"Variable": "$.crawler_status.Crawler.LastCrawl.Status", "StringEquals": "SUCCEEDED", "Next": after_crawler}], "Default": "CrawlerFailed"},
         "CrawlerFailed": {"Type": "Fail", "Cause": "Glue crawler did not succeed"},
         "Commit": {"Type": "Task", "Resource": invoke, "Parameters": {"FunctionName": function_arn, "Payload": {"action": "commit", "window_to.$": "$.window_to", "batch_date.$": "$.batch_date"}}, "OutputPath": "$.Payload", "End": True},
         "Done": {"Type": "Succeed"},

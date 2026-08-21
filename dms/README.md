@@ -1,8 +1,15 @@
 # Deploy AWS DMS: PostgreSQL RDS → S3
 
-Thư mục này chứa notebook triển khai pipeline **one-time full load** bằng AWS Database Migration Service (DMS). Pipeline đọc các dòng cũ trong PostgreSQL RDS và ghi chúng vào Amazon S3 dưới dạng Parquet nén GZIP.
+Thư mục này triển khai pipeline **one-time full load** bằng AWS Database Migration Service (DMS). Pipeline đọc các dòng cũ trong PostgreSQL RDS, ghi chúng vào Amazon S3 dưới dạng Parquet nén GZIP, partition lại theo ngày nghiệp vụ, rồi xóa dữ liệu cũ khỏi RDS sau khi đã verify.
 
-Notebook chỉ **sao chép** dữ liệu. Nó không xóa hoặc cập nhật dòng trong RDS.
+Chỉ có hai notebook:
+
+| Notebook                                     | Nhiệm vụ                                                                      |
+| ----------------------------------------------| -------------------------------------------------------------------------------|
+| [`run_setup.ipynb`](./run_setup.ipynb)       | Tạo resource: hạ tầng DMS, Glue job/crawler. Không xử lý và không xóa dữ liệu |
+| [`run_pipeline.ipynb`](./run_pipeline.ipynb) | Chạy pipeline: full load → repartition → verify → purge                       |
+
+Xóa dữ liệu nguồn luôn là bước cuối và có gate: xem [mục 13](#13-purge-dữ-liệu-nguồn-sau-khi-archive).
 
 ## 1. Kiến trúc
 
@@ -27,17 +34,22 @@ Luồng mạng:
 3. DMS đi tới S3 qua **S3 Gateway VPC Endpoint**, không cần public IP hoặc NAT Gateway.
 4. DMS sử dụng IAM role riêng để ghi dữ liệu vào đúng bucket/prefix.
 
-## 2. Notebook cung cấp những gì?
+## 2. Cấu trúc thư mục
 
-File chính: [`run.ipynb`](./run.ipynb).
+Notebook chỉ là giao diện điều khiển; toàn bộ logic nằm trong module `.py` để dễ diff, test và
+reuse.
 
-Người sử dụng chỉ cần gọi ba hàm:
-
-| Hàm | Mục đích |
+| File | Nội dung |
 |---|---|
-| `setup()` | Tạo hoặc tái sử dụng hạ tầng, test kết nối và bắt đầu full load |
-| `status()` | Xem trạng thái instance, endpoint, task, table và file S3 |
-| `destroy()` | Xóa tài nguyên DMS để ngừng chi phí, nhưng giữ RDS và dữ liệu S3 |
+| [`archive.py`](./archive.py) | Hạ tầng và vận hành DMS: `provision()`, `start()`, `status()`, `destroy()`, `cutoff()` |
+| [`partition_initial.py`](./partition_initial.py) | Deploy và chạy Glue job repartition: `setup_partition_job()`, `run_partition_job()`, `status_partition_job()`, `retry_crawler()`, `destroy_partition_job()` |
+| [`glue_partition_job.py`](./glue_partition_job.py) | Script Spark chạy bên trong Glue |
+| [`purge_source.py`](./purge_source.py) | Verify và xóa dữ liệu nguồn: `verify()`, `purge()`, `status()`, `vacuum()` |
+| [`run_setup.ipynb`](./run_setup.ipynb) | Gọi `archive.provision()` và `partition_initial.setup_partition_job()`, kèm cell teardown |
+| [`run_pipeline.ipynb`](./run_pipeline.ipynb) | Gọi bốn giai đoạn chạy pipeline theo thứ tự |
+
+Ranh giới rõ ràng: `provision()` không start full load, `start()` không tạo hạ tầng. Nhờ vậy
+mở lại notebook setup để sửa/tái tạo resource không bao giờ vô tình chạy lại pipeline.
 
 Các hàm bắt đầu bằng `_` là helper nội bộ. Không cần gọi chúng trực tiếp.
 
@@ -94,7 +106,7 @@ Trong môi trường production nên tạo least-privilege policy cho các resou
 
 ### 3.3. RDS và network
 
-Trước khi chạy `setup()`, kiểm tra:
+Trước khi chạy `provision()`, kiểm tra:
 
 - RDS đang ở trạng thái `available`.
 - Hai DMS subnet thuộc cùng VPC với RDS và nên nằm ở hai Availability Zone khác nhau.
@@ -165,34 +177,39 @@ created_at_utc IS NOT NULL
 AND created_at_utc <= 2026-05-18
 ```
 
-Cutoff được tính theo UTC tại thời điểm `setup()` tạo/cập nhật table mapping.
+Cutoff được tính theo UTC tại thời điểm `start()` cập nhật table mapping, tức là ngay trước khi
+full load thật sự chạy.
 
 ## 5. Cách deploy
 
-### Bước 1 — Mở notebook
+### Bước 1 — Tạo resource
 
-Mở `dms/run.ipynb`, chọn đúng Python kernel, sau đó:
-
-1. Restart Kernel.
-2. Run All để import thư viện và định nghĩa hàm.
-3. Run All không tự gọi AWS vì ba lệnh ở cell cuối mặc định đều được comment.
-
-### Bước 2 — Chạy setup
-
-Trong cell cuối, chạy:
+Mở `dms/run_setup.ipynb`, chọn đúng Python kernel, Restart Kernel rồi chạy lần lượt:
 
 ```python
-setup()
+archive.provision()                        # hạ tầng DMS + task ở trạng thái ready
+partition_initial.setup_partition_job()    # Glue job, crawler, Glue database
 ```
 
-Không đóng kernel trong lúc `setup()` đang chờ AWS tạo resource. Quá trình có thể mất vài phút, chủ yếu do DMS Replication Instance.
+Không đóng kernel trong lúc `provision()` đang chờ AWS. Bước tạo DMS Replication Instance
+thường chiếm phần lớn thời gian. Cả hai hàm đều idempotent nên chạy lại an toàn, và không hàm
+nào start full load.
+
+### Bước 2 — Chạy pipeline
+
+Mở `dms/run_pipeline.ipynb` và chạy theo thứ tự các section. Bắt đầu bằng:
+
+```python
+archive.start()
+```
+
+`start()` tính lại cutoff ngay trước khi start, nên retention tính theo thời điểm chạy thật chứ
+không phải thời điểm `provision()`.
 
 ### Bước 3 — Theo dõi
 
-Sau khi `setup()` thông báo full load đã bắt đầu, chạy:
-
 ```python
-status()
+archive.status()
 ```
 
 Có thể chạy lại `status()` nhiều lần. Hàm này chỉ đọc trạng thái, không restart task.
@@ -207,11 +224,12 @@ Chỉ coi pipeline hoàn tất khi:
 - S3 đã có file dưới `s3://<bucket>/<prefix>/`.
 - Có thể đọc thử Parquet và đối chiếu số dòng/giá trị với truy vấn PostgreSQL tương ứng.
 
-Notebook này không tự xóa dữ liệu nguồn. Việc purge RDS phải là một quy trình riêng, có kiểm tra dữ liệu S3, backup và cơ chế rollback.
+Notebook này không tự xóa dữ liệu nguồn. Việc purge RDS là quy trình riêng ở
+[mục 13](#13-purge-dữ-liệu-nguồn-sau-khi-archive), có verify, dry run và batched delete.
 
-## 6. Chính xác `setup()` làm gì?
+## 6. Chính xác `provision()` làm gì?
 
-`setup()` thực hiện tuần tự các bước sau.
+`provision()` thực hiện tuần tự các bước sau. Bước cuối (6.10) là điểm giao với `start()`.
 
 ### 6.1. Đọc và validate cấu hình
 
@@ -288,7 +306,7 @@ Target endpoint:
 - Compression: GZIP.
 - Service access role: `<DMS_PREFIX>-s3-role`.
 
-Endpoint đã tồn tại sẽ được tái sử dụng. Nếu thay đổi host, database, credential, bucket hoặc prefix sau khi endpoint đã được tạo, cách rõ ràng nhất cho môi trường demo là chạy `destroy()` rồi `setup()` lại.
+Endpoint đã tồn tại sẽ được tái sử dụng. Nếu thay đổi host, database, credential, bucket hoặc prefix sau khi endpoint đã được tạo, cách rõ ràng nhất cho môi trường demo là chạy `destroy()` rồi `provision()` lại.
 
 ### 6.8. Test cả hai endpoint
 
@@ -309,9 +327,9 @@ Table mapping chỉ include `SOURCE_SCHEMA.SOURCE_TABLE` và có hai source filt
 
 Hai filter được tách riêng vì DMS kết hợp các filter riêng bằng **AND**. Nếu gộp không đúng, mapping có thể chọn nhiều dòng hơn dự kiến.
 
-### 6.10. Tạo và start replication task
+### 6.10. Tạo replication task
 
-Task có tên `<DMS_PREFIX>-task` với:
+`provision()` chỉ **tạo** task tên `<DMS_PREFIX>-task` và chờ nó rời trạng thái `creating`:
 
 - Migration type: `full-load`.
 - Target table preparation: `DO_NOTHING`.
@@ -319,13 +337,13 @@ Task có tên `<DMS_PREFIX>-task` với:
 - Commit rate: 10.000.
 - CloudWatch logging được bật.
 
-Xử lý theo trạng thái:
+Việc start thuộc về `start()` trong notebook pipeline:
 
-| Trạng thái hiện tại | Hành vi của `setup()` |
+| Trạng thái hiện tại | Hành vi của `start()` |
 |---|---|
-| Chưa có task | Tạo task mới |
-| `ready` | Cập nhật mapping hiện tại rồi start |
-| `starting` / `running` | Không start lần nữa |
+| Chưa có task | Báo lỗi và yêu cầu chạy `provision()` trước |
+| `ready` | Tính lại cutoff, cập nhật mapping, rồi start |
+| `starting` / `running` | Không start lần nữa, trả về cutoff đang dùng |
 | `stopped`, không có table lỗi | Xem là full load đã hoàn tất, không replay |
 | `stopped` có lỗi / `failed` | Báo lỗi và yêu cầu kiểm tra `status()` |
 
@@ -345,7 +363,7 @@ Tiến độ      : 40% | completed=0 | loading=1 | queued=0 | errors=0
 
 Ý nghĩa:
 
-- `ready` và `0%`: task đã tạo nhưng chưa được start; chạy lại `setup()` và xem lỗi trước dòng start.
+- `ready` và `0%`: task đã tạo nhưng chưa được start; chạy `start()` trong notebook pipeline.
 - `starting` và `0%`: DMS đang khởi tạo, chờ rồi chạy lại `status()`.
 - `running`: full load đang thực hiện.
 - `stopped` và `errors=0`: full load thường đã hoàn tất; kiểm tra stop reason và S3.
@@ -427,7 +445,7 @@ Notebook hiện tại không còn dùng waiter này. Reload file từ ổ đĩa,
 
 Xem trạng thái task trước:
 
-- `ready`: chưa start; chạy lại `setup()`.
+- `ready`: chưa start; chạy `start()`.
 - `starting`: chờ DMS khởi tạo.
 - `running` nhưng chưa có table: kiểm tra table mapping và tên schema/table.
 - `stopped`: xem table statistics, stop reason và lỗi.
@@ -439,7 +457,7 @@ Notebook đọc `.env` lại ở mỗi lệnh, nhưng AWS endpoint/task đã t�
 1. Xác minh dữ liệu S3 hiện có.
 2. Chạy `destroy()`.
 3. Sửa `.env`.
-4. Chạy `setup()`.
+4. Chạy `provision()` rồi `start()`.
 
 `destroy()` không xóa file S3 cũ. Nếu chạy lại vào cùng prefix, cần chủ động chọn prefix mới hoặc quản lý file cũ để tránh nhầm dữ liệu giữa các lần chạy.
 
@@ -451,8 +469,8 @@ Notebook đọc `.env` lại ở mỗi lệnh, nhưng AWS endpoint/task đã t�
 - [ ] RDS security group cho phép DMS security group truy cập PostgreSQL.
 - [ ] Database user có quyền đọc bảng nguồn.
 - [ ] Đã chọn đúng `DATE_COLUMN` và retention.
-- [ ] Đã chạy Restart Kernel → Run All.
-- [ ] `setup()` test thành công cả RDS và S3.
+- [ ] Đã Restart Kernel trước khi chạy notebook.
+- [ ] `provision()` test thành công cả RDS và S3.
 - [ ] `status()` báo `errors=0`.
 - [ ] Đã kiểm tra file Parquet và đối chiếu dữ liệu.
 - [ ] Đã chạy `destroy()` khi không cần DMS instance nữa.
@@ -472,12 +490,12 @@ Notebook phù hợp cho demo, học tập và one-time archive có kiểm soát.
 
 ## 12. Repartition full load theo Hive style
 
-Nếu muốn chạy theo từng cell và xem config/status dễ hơn, mở `dms/run_partition_initial.ipynb`.
+Bước này nằm ở section 2 của `dms/run_pipeline.ipynb`.
 
 DMS full load chỉ là **raw landing**. Native DMS date partition dựa trên transaction commit
 date và không partition full-load rows theo `DATE_COLUMN`. Nó cũng không tạo key folder dạng
-`year=.../month=.../day=...`. Vì vậy sau khi `status()` xác nhận DMS hoàn tất, chạy Glue
-bootstrap job:
+`year=.../month=.../day=...`. Vì vậy sau khi `archive.status()` xác nhận DMS hoàn tất, chạy
+Glue bootstrap job. Ngoài notebook, có thể chạy trực tiếp:
 
 ```powershell
 cd dms
@@ -538,8 +556,8 @@ destroy_partition_job()
 ```
 
 Hàm này xóa Glue job, crawler và IAM role của bước repartition; không xóa DMS raw,
-curated objects, Glue database hoặc catalog tables. `destroy()` trong `dms/run.ipynb` vẫn
-là hàm riêng để xóa DMS replication resources.
+curated objects, Glue database hoặc catalog tables. `archive.destroy()` vẫn là hàm riêng để
+xóa DMS replication resources. Cả hai nằm ở section teardown của `run_setup.ipynb`.
 
 ### Crawler báo `Service is unable to assume provided role`
 
@@ -576,3 +594,120 @@ run_id = partition_initial.run_partition_job(wait=False)
 ```
 
 Không cần xóa curated data trước khi retry; job dùng dynamic partition overwrite.
+
+## 13. Purge dữ liệu nguồn sau khi archive
+
+Archive xong chưa phải là hết việc: dữ liệu cũ vẫn còn trong RDS. Bước purge nằm ở
+[`purge_source.py`](./purge_source.py), chạy ở section 3 và 4 của
+[`run_pipeline.ipynb`](./run_pipeline.ipynb).
+
+Nguyên tắc: **archive -> verify -> purge**. Module không bao giờ tự suy diễn phạm vi xóa.
+
+```mermaid
+flowchart LR
+    DMS["DMS full load"] --> GLUE["Glue repartition<br/>+ crawler"]
+    GLUE --> VERIFY["verify()<br/>RDS vs Athena"]
+    VERIFY -->|PASSED| DRY["purge(dry_run=True)"]
+    DRY --> PURGE["purge(dry_run=False)<br/>batched delete"]
+    PURGE --> VACUUM["vacuum()"]
+    VERIFY -->|FAILED| STOP["Dừng, không xóa"]
+```
+
+### 13.1. Điều kiện trước khi purge
+
+- DMS task đã hoàn tất với `errors=0`.
+- Glue repartition job và crawler đã `SUCCEEDED`, catalog table đã có partition.
+- Máy chạy notebook kết nối được PostgreSQL. RDS security group phải cho phép IP hiện tại;
+  `database/RDS/run.ipynb -> connect()` có helper mở port cho IP của bạn.
+- Có snapshot RDS hoặc backup trong retention window để rollback.
+- Identity AWS cần thêm quyền: `athena:StartQueryExecution`, `athena:GetQueryExecution`,
+  `athena:GetQueryResults`, `glue:GetTable/GetPartitions`, và `s3:GetObject/PutObject/ListBucket`
+  cho `ATHENA_OUTPUT`.
+- Cài thêm `psycopg2-binary`.
+
+### 13.2. Cutoff lấy từ đâu
+
+`cutoff()` đọc lại table mapping thật của DMS task và lấy đúng giá trị `lte` của `DATE_COLUMN`.
+Đây là cùng một nguồn sự thật mà `rds_daily_pipeline` dùng để seed watermark, nên purge, archive
+và daily pipeline không bao giờ lệch boundary.
+
+Nếu đã chạy `destroy()` và task không còn tồn tại, purge sẽ dừng lại và yêu cầu đặt
+`PURGE_CUTOFF` trong `dms/.env` bằng đúng cutoff của lần full load đó. Session PostgreSQL được
+ép `SET TIME ZONE 'UTC'` vì cutoff của DMS là UTC.
+
+### 13.3. Verify
+
+```python
+purge_source.verify()
+```
+
+Hàm so sánh trong đúng phạm vi `DATE_COLUMN IS NOT NULL AND DATE_COLUMN <= cutoff`:
+
+| Chỉ số | RDS | Archive (Athena trên curated table) |
+|---|---|---|
+| Số row | `count(*)` | `count(*)` |
+| Số key | `count(DISTINCT order_id)` | `count(DISTINCT order_id)` |
+| Checksum | `sum(amount)` | `sum(amount)` |
+
+Verify `FAILED` khi archive thiếu key so với RDS, hoặc archive rỗng trong khi RDS còn dữ liệu cũ.
+Nếu `archive_rows > archive_keys`, hàm cảnh báo có row trùng key — thường do full load bị replay
+vào cùng prefix. `purge()` luôn gọi `verify()` trước và raise nếu không PASSED.
+
+### 13.4. Dry run và purge
+
+```python
+purge_source.purge(dry_run=True)   # chỉ đếm
+purge_source.purge(dry_run=False)  # thực sự xóa
+```
+
+Cách purge hoạt động:
+
+1. Tải danh sách distinct key đã archive từ Athena. Nếu vượt `PURGE_MAX_KEYS`, hàm dừng và
+   khuyến nghị dùng partition detach/drop thay vì batched delete.
+2. Duyệt RDS bằng keyset pagination theo primary key, mỗi lần `PURGE_BATCH_SIZE` row.
+3. Trong mỗi batch, chỉ xóa key **có trong archive**. Key chưa archive được tính vào `skipped`
+   và giữ nguyên trong RDS. Đây là trường hợp bình thường khi có row mới insert với ngày cũ
+   sau khi DMS đã chạy.
+4. Xóa child rows trước parent theo `PURGE_CHILD_TABLES`, vì `order_items` có foreign key tới
+   `orders`. Bảng `orders` được archive nhưng `order_items` thì không, nên nếu cần giữ lịch sử
+   line item thì phải archive bảng đó trước khi purge.
+5. Commit từng batch để commit ngắn, giảm lock và WAL spike. Lỗi giữa đường sẽ rollback batch
+   đang chạy; các batch đã commit vẫn hợp lệ vì chúng chỉ chứa key đã archive.
+
+### 13.5. Sau khi purge
+
+```python
+purge_source.status()   # còn bao nhiêu row trong phạm vi cutoff
+purge_source.vacuum()   # VACUUM (ANALYZE) orders + child tables
+```
+
+`status()` nên báo `0` row còn lại trong cutoff, hoặc đúng bằng số `skipped`.
+
+Lưu ý chi phí: xóa row **không** làm allocated storage của RDS instance nhỏ lại. `VACUUM` chỉ
+giải phóng space để tái sử dụng bên trong file dữ liệu. Muốn giảm thật storage cost thì cần
+right-size instance hoặc migrate sang instance có allocated storage nhỏ hơn.
+
+### 13.6. Biến `.env` cho purge
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `PRIMARY_KEY` | `order_id` | Primary key dùng để đối chiếu và phân trang |
+| `PURGE_CHILD_TABLES` | `order_items:order_id` | Danh sách `table:fk_column` xóa cùng parent |
+| `PURGE_CHECKSUM_COLUMN` | `amount` | Cột numeric để so tổng; để rỗng nếu muốn bỏ qua |
+| `PURGE_BATCH_SIZE` | `500` | Số key mỗi batch delete |
+| `PURGE_MAX_KEYS` | `200000` | Ngưỡng an toàn cho batched delete |
+| `PURGE_CUTOFF` | rỗng | Chỉ dùng khi DMS task đã bị destroy |
+| `GLUE_CURATED_TABLE` | `<GLUE_TABLE_PREFIX><tên folder cuối của CURATED_PREFIX>` | Catalog table do crawler tạo |
+| `ATHENA_OUTPUT` | `s3://<S3_BUCKET>/athena-results/purge/` | Nơi Athena ghi kết quả |
+| `ATHENA_WORKGROUP` | `primary` | Athena workgroup |
+
+### 13.7. Checklist purge
+
+- [ ] DMS task `errors=0` và đã kiểm tra dữ liệu S3.
+- [ ] Crawler `SUCCEEDED`, query Athena trên curated table trả về dữ liệu.
+- [ ] Có snapshot/backup RDS.
+- [ ] `verify()` báo `PASSED`.
+- [ ] `purge(dry_run=True)` cho số liệu đúng như mong đợi.
+- [ ] `purge(dry_run=False)` chạy xong không lỗi.
+- [ ] `status()` xác nhận phạm vi cutoff đã sạch.
+- [ ] Đã chạy `vacuum()` và ghi nhận rằng allocated storage không tự giảm.

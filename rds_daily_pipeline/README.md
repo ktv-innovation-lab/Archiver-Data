@@ -13,8 +13,9 @@ EventBridge daily
     → Lambda chuẩn bị window (watermark, now - retention]
     → Glue đọc PostgreSQL qua JDBC
        → S3 raw theo year/month/day của DATE_COLUMN
-       → normalize/publish S3 curated Parquet
+       → normalize/publish S3 curated Parquet (parent + child tables)
     → Glue Crawler cập nhật Data Catalog
+    → Glue purge job: verify archive rồi xóa đúng window đó khỏi RDS
     → Lambda commit watermark
 ```
 
@@ -100,15 +101,67 @@ Sau khi deploy, chạy thử thủ công trong Step Functions với state machin
 execution đầu tiên thành công, đổi thành `true` và chạy lại `python deploy.py`.
 
 Teardown bằng cell cuối notebook hoặc `deploy.destroy()`. Hàm này dừng execution/job đang
-chạy và xóa schedule, workflow, Lambda, Glue job/crawler/connection, control table và IAM
-roles. Nó giữ nguyên RDS, toàn bộ S3 data, Glue database và catalog tables.
+chạy và xóa schedule, workflow, Lambda, Glue jobs (archive + purge), crawler, connection,
+control table và IAM roles. Nó giữ nguyên RDS, toàn bộ S3 data, Glue database và catalog
+tables.
+
+## Purge: xóa dữ liệu khỏi RDS sau khi archive
+
+Archive mà không xóa thì RDS không hề nhỏ lại. Bước purge nằm trong cùng workflow, ngay
+giữa crawler và commit watermark, và chạy bởi Glue job `<PIPELINE_NAME>-purge-source`.
+
+Purge dùng lại Glue Connection của archive job, nên nó vào được private subnet và dùng
+JDBC driver PostgreSQL có sẵn trong Glue 4.0. Không cần Lambda trong VPC, không cần
+`pip install` trong subnet không có NAT.
+
+Thứ tự bắt buộc là **archive → verify → purge**. Job tự fail nếu verify không đạt:
+
+1. Đọc key (và `PURGE_CHECKSUM_COLUMN` nếu có) của window từ RDS.
+2. Đọc curated Parquet của đúng các day partition thuộc window đó.
+3. Anti-join: mọi key trong RDS phải có trong archive. Thiếu một key là fail.
+4. Checksum trong RDS không được lớn hơn trong archive.
+5. Mỗi child table trong `PURGE_CHILD_TABLES` phải archive đủ số row của window.
+6. Chỉ khi tất cả PASSED mới xóa, child trước parent, mỗi batch một transaction.
+
+Bật purge trong `.env`:
+
+```text
+ENABLE_PURGE=false     # true để chèn state PurgeSource vào workflow
+PURGE_DRY_RUN=true     # true: chỉ verify và in số row sẽ xóa
+PURGE_CHILD_TABLES=order_items:order_id
+PURGE_CHECKSUM_COLUMN=amount
+PURGE_BATCH_SIZE=500
+PURGE_VACUUM=false
+```
+
+Quy trình lên production nên đi ba bước, mỗi bước chạy lại `deploy.setup()`:
+
+1. `ENABLE_PURGE=false` — chạy vài ngày, xác nhận curated data đúng.
+2. `ENABLE_PURGE=true` + `PURGE_DRY_RUN=true` — log của Glue job in `Verify: PASSED`
+   và số row sẽ xóa. RDS chưa mất gì.
+3. `PURGE_DRY_RUN=false` — bắt đầu xóa thật.
+
+Child table được archive cùng window với parent, bằng một join trên `PRIMARY_KEY` và
+partition theo `DATE_COLUMN` của parent. Nhờ vậy `order_items` nằm ở
+`curated/rds/order_items/year=.../month=.../day=.../`, cùng cấp với `curated/rds/orders/`,
+và crawler catalog cả hai. Nếu không archive child, purge sẽ xóa child theo foreign key
+trong khi S3 chưa có bản sao — đó là lý do hai việc này nằm chung một pipeline.
+
+`PURGE_VACUUM=true` chạy `VACUUM (ANALYZE)` sau khi xóa. Việc này giảm bloat và refresh
+statistics, nhưng allocated storage của RDS instance vẫn không tự thu nhỏ.
+
+`DATE_COLUMN` phải có index. Không có index thì mỗi batch DELETE là một sequential scan.
 
 ## Retry và idempotency
 
 - Raw và curated có layout `year=YYYY/month=MM/day=DD` theo `DATE_COLUMN`.
 - Dynamic partition overwrite khiến retry chỉ thay những ngày có trong window hiện tại.
-- Watermark chỉ commit sau khi Glue job và crawler thành công.
+- Watermark chỉ commit sau khi Glue job, crawler và purge thành công.
 - Nếu Glue lỗi, execution fail và watermark giữ nguyên; lần chạy lại xử lý cùng window.
+- Purge cũng idempotent: chạy lại window đã xóa thì bước verify thấy `0 row` trong RDS và
+  job thoát sớm, không xóa lan sang window khác.
+- Nếu purge fail giữa các batch, các batch đã commit vẫn giữ, window được verify lại từ
+  phần còn lại ở lần chạy sau.
 
 Đây là **at-least-once orchestration + idempotent output**, dễ hiểu và an toàn hơn việc cố
 giả lập exactly-once bằng cách restart DMS.
@@ -119,8 +172,24 @@ Job dùng `SELECT *` để giữ schema RDS trong bản demo. Với bảng lớn
 
 1. Chỉ select các cột cần archive.
 2. Bảo đảm `DATE_COLUMN` có index; nếu không PostgreSQL phải sequential scan mỗi ngày.
-3. Chỉ archive trạng thái terminal. `closed_at_utc IS NOT NULL` tự nhiên thỏa điều này nếu
-   dữ liệu nghiệp vụ được quản lý đúng.
+   `database/RDS/schema.sql` chỉ có `idx_orders_status_closed (status, closed_at_utc)`.
+   Index đó dẫn đầu bằng `status` nên một predicate chỉ trên `closed_at_utc` không dùng
+   được nó. Khi lên volume thật, thêm index trên đúng cột đang cấu hình:
+
+   ```sql
+   CREATE INDEX idx_orders_closed_at ON orders (closed_at_utc);
+   -- hoặc, nếu DATE_COLUMN=created_at_utc:
+   CREATE INDEX idx_orders_created_at ON orders (created_at_utc);
+   ```
+
+   Index này phục vụ cả archive query lẫn vòng lặp DELETE của purge.
+3. Chỉ archive trạng thái terminal. `DATE_COLUMN=closed_at_utc` tự nhiên thỏa điều này:
+   order còn `OPEN` có `closed_at_utc IS NULL` nên bị loại khỏi window.
+   `DATE_COLUMN=created_at_utc` thì khác: nó archive mọi order đủ tuổi, kể cả order vẫn
+   đang `OPEN` và còn thay đổi. Khi bật purge, những row đó bị xóa khỏi RDS trong lúc
+   nghiệp vụ chưa xong. Nếu vẫn muốn dùng `created_at_utc`, hãy thêm điều kiện trạng thái
+   terminal vào query của `glue_job.py` và vào `window_sql` của `purge_job.py` — hai chỗ
+   phải giống nhau, nếu không verify sẽ báo thiếu key.
 4. Sau khi volume lớn, thêm JDBC partitioning theo primary key để Glue đọc song song.
 
 Crawler tạo tên table từ folder S3 và thêm prefix trong `GLUE_TABLE`. Hãy kiểm tra tên thực
@@ -141,4 +210,10 @@ không commit `.env`. Glue role, bucket policy và KMS key cũng cần thu hẹp
   Setup luôn repair principal `lambda.amazonaws.com` và retry `CreateFunction` tối đa 120 giây.
 - `Could not find driver`: dùng Glue 4.0 như cấu hình, không đổi sang Python Shell job.
 - Job chạy nhưng `0 rows`: chưa có record nào vừa đủ retention hoặc chọn sai `DATE_COLUMN`.
+- Purge fail `key trong RDS chưa có trong archive`: archive job của window đó chưa ghi đủ.
+  Chạy lại execution; đừng tắt verify.
+- Purge fail `Child ... chưa archive đủ`: kiểm tra `PURGE_CHILD_TABLES` và `PRIMARY_KEY`
+  có khớp foreign key thật không.
+- `Missing a real value for PRIMARY_KEY`: `.env` cũ chưa có biến này; copy thêm từ
+  `.env.example`.
 - Cron lệch giờ: EventBridge cron dùng UTC; `02:00 UTC` là `09:00` Bangkok.
